@@ -6,8 +6,251 @@
   <title>SLK — Word Grid Game</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
-  <!-- Supabase JS client -->
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- Firebase -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
+    import { getDatabase, ref, onValue, set, get } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-database.js";
+
+    // ═══════════════════════════════════════════════════════════════
+    //  CONFIGURATION — paste your Firebase project values here
+    //  See setup instructions below
+    // ═══════════════════════════════════════════════════════════════
+    const firebaseConfig = {
+  apiKey:            "AIzaSyCBS1yohr1r0W0XXlQu9GzdLiV0myJX3H8",
+  authDomain:        "slkgame.firebaseapp.com",
+  databaseURL:       "https://slkgame-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId:         "slkgame",
+  storageBucket:     "slkgame.firebasestorage.app",
+  messagingSenderId: "704837044087",
+  appId:             "1:704837044087:web:30076a3fbbec3cef300372"
+};
+    };
+    // ═══════════════════════════════════════════════════════════════
+
+    const app = initializeApp(firebaseConfig);
+    const db  = getDatabase(app);
+
+    // Room from URL ?room=Name, defaults to Lobby
+    const params  = new URLSearchParams(window.location.search);
+    const ROOM_ID = (params.get('room') || 'Lobby').replace(/[.#$[\]]/g, '_');
+
+    // ── STATE ────────────────────────────────────────────────────────
+    let gameState       = { grid: Array(25).fill(''), turn: 1, notes: '' };
+    let selectedIndices = [];
+    let myPlayerNumber  = localStorage.getItem('player_num_' + ROOM_ID);
+    let isLocked        = false;
+    let connected       = false;
+    let notesEditing    = false;
+
+    // ── FIREBASE INIT ────────────────────────────────────────────────
+    function init() {
+      document.getElementById('roomTag').textContent = 'Room: ' + ROOM_ID;
+
+      const roomRef = ref(db, 'rooms/' + ROOM_ID);
+
+      // Subscribe — onValue fires immediately with current state,
+      // then again on every subsequent change
+      onValue(roomRef, (snapshot) => {
+        const incoming = snapshot.val();
+
+        if (!connected) {
+          // First fire — initial load
+          connected = true;
+          if (incoming) {
+            gameState = incoming;
+            if (myPlayerNumber && parseInt(myPlayerNumber) !== gameState.turn) {
+              isLocked = true;
+            }
+          }
+          render();
+          return;
+        }
+
+        // Subsequent fires — a move came in from the other player
+        if (!incoming) return;
+
+        gameState = incoming;
+
+        // Unlock when it becomes our turn
+        if (myPlayerNumber && parseInt(myPlayerNumber) === gameState.turn) {
+          isLocked = false;
+        }
+
+        // Sync notes only if user isn't actively typing in the box
+        if (!notesEditing) {
+          document.getElementById('gameNotes').value = gameState.notes || '';
+        }
+
+        render();
+      });
+    }
+
+    // ── SAVE STATE TO FIREBASE ───────────────────────────────────────
+    async function saveState(state) {
+      const roomRef = ref(db, 'rooms/' + ROOM_ID);
+      try {
+        await set(roomRef, state);
+      } catch (e) {
+        console.error('Save error:', e);
+      }
+    }
+
+    // ── RENDER ───────────────────────────────────────────────────────
+    function render() {
+      renderGrid();
+      renderStatus();
+      renderCellCount();
+    }
+
+    function renderGrid() {
+      const gridEl = document.getElementById('gameGrid');
+      gridEl.innerHTML = '';
+
+      const colCoords = document.getElementById('colCoords');
+      colCoords.innerHTML = '';
+      'ABCDE'.split('').forEach(c => {
+        const d = document.createElement('div');
+        d.className = 'coord';
+        d.textContent = c;
+        colCoords.appendChild(d);
+      });
+
+      const canAct = !isLocked && connected;
+      gridEl.classList.toggle('locked', !canAct);
+
+      for (let i = 0; i < 25; i++) {
+        const cell     = document.createElement('div');
+        cell.className = 'cell';
+        const cellData = gameState.grid[i];
+
+        if (cellData && cellData.char) {
+          cell.textContent = cellData.char;
+          cell.classList.add('occupied', cellData.p === 1 ? 'p1-cell' : 'p2-cell');
+        } else {
+          if (selectedIndices.includes(i)) cell.classList.add('selected');
+          cell.onclick = () => toggleCell(i);
+        }
+        gridEl.appendChild(cell);
+      }
+    }
+
+    function renderStatus() {
+      if (!connected) { setStatus('connecting', 'Connecting…'); return; }
+      if (!myPlayerNumber) {
+        setStatus('waiting', 'Player ' + gameState.turn + ' to move — join as either player');
+        return;
+      }
+      const isMyTurn = parseInt(myPlayerNumber) === gameState.turn;
+      if (isMyTurn) {
+        setStatus('your-turn', '▶  Your turn  (Player ' + myPlayerNumber + ')');
+      } else {
+        setStatus('waiting', '⌛  Waiting for Player ' + gameState.turn);
+      }
+    }
+
+    function setStatus(cls, text) {
+      const el = document.getElementById('status');
+      el.className = cls;
+      el.textContent = text;
+    }
+
+    function renderCellCount() {
+      const word    = document.getElementById('wordInput').value.trim().toUpperCase();
+      const countEl = document.getElementById('cellCount');
+      const btn     = document.getElementById('submitBtn');
+      const sel     = selectedIndices.length;
+      const wlen    = word.length;
+
+      if (sel === 0) {
+        countEl.className   = 'cell-count';
+        countEl.textContent = 'select cells on the grid';
+        btn.disabled = true;
+        return;
+      }
+
+      const match = sel > 0 && sel === wlen;
+      countEl.className   = 'cell-count ' + (match ? 'match' : 'mismatch');
+      countEl.textContent = sel + ' cell' + (sel !== 1 ? 's' : '') +
+                            ' selected  ·  ' + wlen + ' letter' + (wlen !== 1 ? 's' : '');
+
+      const canSubmit = match && connected && !isLocked &&
+        (!myPlayerNumber || parseInt(myPlayerNumber) === gameState.turn);
+      btn.disabled = !canSubmit;
+    }
+
+    // ── INTERACTION ──────────────────────────────────────────────────
+    function toggleCell(i) {
+      if (isLocked || !connected) return;
+      const idx = selectedIndices.indexOf(i);
+      if (idx > -1) selectedIndices.splice(idx, 1);
+      else selectedIndices.push(i);
+      render();
+    }
+
+    document.getElementById('wordInput').addEventListener('input', renderCellCount);
+
+    // Notes: track focus to avoid overwriting while typing
+    const notesBox = document.getElementById('gameNotes');
+    notesBox.addEventListener('focus', () => { notesEditing = true; });
+    notesBox.addEventListener('blur',  async () => {
+      notesEditing      = false;
+      gameState.notes   = notesBox.value;
+      await saveState(gameState);
+    });
+
+    async function submitMove() {
+      if (isLocked || !connected) return;
+
+      const val = document.getElementById('wordInput').value.trim().toUpperCase();
+      if (selectedIndices.length === 0 || val.length !== selectedIndices.length) {
+        alert('Selected cells must match the number of letters typed.');
+        return;
+      }
+
+      if (!myPlayerNumber) {
+        myPlayerNumber = String(gameState.turn);
+        localStorage.setItem('player_num_' + ROOM_ID, myPlayerNumber);
+      }
+
+      if (parseInt(myPlayerNumber) !== gameState.turn) {
+        alert("It's not your turn.");
+        return;
+      }
+
+      selectedIndices.forEach((idx, i) => {
+        if (val[i]) gameState.grid[idx] = { char: val[i], p: parseInt(myPlayerNumber) };
+      });
+
+      gameState.turn  = gameState.turn === 1 ? 2 : 1;
+      gameState.notes = notesBox.value;
+
+      isLocked        = true;
+      selectedIndices = [];
+      document.getElementById('wordInput').value = '';
+
+      render();
+      await saveState(gameState);
+    }
+
+    async function resetGame() {
+      if (!confirm('Reset the game? This clears the board for both players.')) return;
+      localStorage.removeItem('player_num_' + ROOM_ID);
+      myPlayerNumber  = null;
+      isLocked        = false;
+      selectedIndices = [];
+      gameState = { grid: Array(25).fill(''), turn: 1, notes: '' };
+      notesBox.value  = '';
+      render();
+      await saveState(gameState);
+    }
+
+    // Expose button handlers to global scope (called from HTML onclick)
+    window.submitMove = submitMove;
+    window.resetGame  = resetGame;
+
+    // ── START ────────────────────────────────────────────────────────
+    init();
+  </script>
   <style>
     :root {
       --ink: #1a1a2e;
@@ -45,13 +288,10 @@
         );
     }
 
-    header {
-      text-align: center;
-      margin-bottom: 18px;
-    }
+    header { text-align: center; margin-bottom: 18px; }
 
     header h1 {
-      font-family: 'IBM Plex Mono', serif;
+      font-family: 'Playfair Display', serif;
       font-size: clamp(2rem, 6vw, 3.2rem);
       font-weight: 900;
       letter-spacing: -0.02em;
@@ -104,7 +344,6 @@
       max-width: 820px;
     }
 
-    /* ── GRID ── */
     .grid-wrapper {
       display: flex;
       flex-direction: column;
@@ -133,7 +372,7 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      font-family: 'IBM Plex Mono', serif;
+      font-family: 'Playfair Display', serif;
       font-size: clamp(20px, 4.5vw, 28px);
       font-weight: 700;
       cursor: pointer;
@@ -165,7 +404,6 @@
       letter-spacing: 0.05em;
     }
 
-    /* ── SIDE PANEL ── */
     .side-panel {
       display: flex;
       flex-direction: column;
@@ -335,257 +573,5 @@
   </div>
 </div>
 
-<script>
-  // ═══════════════════════════════════════════════════════════════
-  //  CONFIGURATION — fill these in after creating your Supabase project
-  //  See README.md for step-by-step setup instructions
-  // ═══════════════════════════════════════════════════════════════
-  const SUPABASE_URL  = 'https://xyllpshcfyymnetehlfn.supabase.co';
-  const SUPABASE_ANON = 'sb_publishable_pZWmpwxYhzZN6aFrh40uWA_Gf8VJY69';
-  const TABLE_NAME    = 'slk_rooms';
-  // ═══════════════════════════════════════════════════════════════
-
-  const { createClient } = supabase;
-  const db = createClient(SUPABASE_URL, SUPABASE_ANON);
-
-  // Room from URL ?room=Name, defaults to Lobby
-  const params  = new URLSearchParams(window.location.search);
-  const ROOM_ID = params.get('room') || 'Lobby';
-
-  // ── STATE ────────────────────────────────────────────────────────
-  let gameState       = { grid: Array(25).fill(''), turn: 1, notes: '' };
-  let selectedIndices = [];
-  let myPlayerNumber  = localStorage.getItem('player_num_' + ROOM_ID);
-  let isLocked        = false;
-  let connected       = false;
-
-  // ── SUPABASE INIT ────────────────────────────────────────────────
-  async function init() {
-    document.getElementById('roomTag').textContent = 'Room: ' + ROOM_ID;
-
-    // 1. Load existing state from DB
-    const { data, error } = await db
-      .from(TABLE_NAME)
-      .select('state')
-      .eq('room_id', ROOM_ID)
-      .single();
-
-    if (data && data.state) {
-      gameState = data.state;
-      // Restore lock if it's not our turn
-      if (myPlayerNumber && parseInt(myPlayerNumber) !== gameState.turn) {
-        isLocked = true;
-      }
-    } else {
-      // Room doesn't exist yet — will be created on first move
-      console.log('New room, starting fresh');
-    }
-
-    connected = true;
-    render();
-
-    // 2. Subscribe to real-time changes on this room row
-    db.channel('room:' + ROOM_ID)
-      .on(
-        'postgres_changes',
-        {
-          event:  '*',
-          schema: 'public',
-          table:  TABLE_NAME,
-          filter: 'room_id=eq.' + ROOM_ID
-        },
-        (payload) => {
-          const incoming = payload.new && payload.new.state;
-          if (!incoming) return;
-
-          // Don't overwrite our own just-submitted state
-          gameState = incoming;
-
-          // Unlock when it becomes our turn
-          if (myPlayerNumber && parseInt(myPlayerNumber) === gameState.turn) {
-            isLocked = false;
-          }
-
-          // Sync notes if not actively editing
-          const nBox = document.getElementById('gameNotes');
-          if (document.activeElement !== nBox) {
-            nBox.value = gameState.notes || '';
-          }
-
-          render();
-        }
-      )
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          console.log('Real-time subscribed for room:', ROOM_ID);
-        }
-      });
-  }
-
-  // ── SAVE STATE TO SUPABASE ───────────────────────────────────────
-  async function saveState(state) {
-    const { error } = await db
-      .from(TABLE_NAME)
-      .upsert(
-        { room_id: ROOM_ID, state: state, updated_at: new Date().toISOString() },
-        { onConflict: 'room_id' }
-      );
-    if (error) console.error('Save error:', error);
-  }
-
-  // ── RENDER ───────────────────────────────────────────────────────
-  function render() {
-    renderGrid();
-    renderStatus();
-    renderCellCount();
-  }
-
-  function renderGrid() {
-    const gridEl = document.getElementById('gameGrid');
-    gridEl.innerHTML = '';
-
-    // Column coords
-    const colCoords = document.getElementById('colCoords');
-    colCoords.innerHTML = '';
-    'ABCDE'.split('').forEach(c => {
-      const d = document.createElement('div');
-      d.className = 'coord';
-      d.textContent = c;
-      colCoords.appendChild(d);
-    });
-
-    const canAct = !isLocked && connected;
-    gridEl.classList.toggle('locked', !canAct);
-
-    for (let i = 0; i < 25; i++) {
-      const cell = document.createElement('div');
-      cell.className = 'cell';
-      const cellData = gameState.grid[i];
-
-      if (cellData && cellData.char) {
-        cell.textContent = cellData.char;
-        cell.classList.add('occupied', cellData.p === 1 ? 'p1-cell' : 'p2-cell');
-      } else {
-        if (selectedIndices.includes(i)) cell.classList.add('selected');
-        cell.onclick = () => toggleCell(i);
-      }
-      gridEl.appendChild(cell);
-    }
-  }
-
-  function renderStatus() {
-    if (!connected) { setStatus('connecting', 'Connecting…'); return; }
-    if (!myPlayerNumber) {
-      setStatus('waiting', 'Player ' + gameState.turn + ' to move — join as either player');
-      return;
-    }
-    const isMyTurn = parseInt(myPlayerNumber) === gameState.turn;
-    if (isMyTurn) {
-      setStatus('your-turn', '▶  Your turn  (Player ' + myPlayerNumber + ')');
-    } else {
-      setStatus('waiting', '⌛  Waiting for Player ' + gameState.turn);
-    }
-  }
-
-  function setStatus(cls, text) {
-    const el = document.getElementById('status');
-    el.className = cls;
-    el.textContent = text;
-  }
-
-  function renderCellCount() {
-    const word    = document.getElementById('wordInput').value.trim().toUpperCase();
-    const countEl = document.getElementById('cellCount');
-    const btn     = document.getElementById('submitBtn');
-    const sel     = selectedIndices.length;
-    const wlen    = word.length;
-
-    if (sel === 0) {
-      countEl.className = 'cell-count';
-      countEl.textContent = 'select cells on the grid';
-      btn.disabled = true;
-      return;
-    }
-
-    const match = sel > 0 && sel === wlen;
-    countEl.className   = 'cell-count ' + (match ? 'match' : 'mismatch');
-    countEl.textContent = sel + ' cell' + (sel !== 1 ? 's' : '') +
-                          ' selected  ·  ' + wlen + ' letter' + (wlen !== 1 ? 's' : '');
-
-    const canSubmit = match && connected && !isLocked &&
-      (!myPlayerNumber || parseInt(myPlayerNumber) === gameState.turn);
-    btn.disabled = !canSubmit;
-  }
-
-  // ── INTERACTION ──────────────────────────────────────────────────
-  function toggleCell(i) {
-    if (isLocked || !connected) return;
-    const idx = selectedIndices.indexOf(i);
-    if (idx > -1) selectedIndices.splice(idx, 1);
-    else selectedIndices.push(i);
-    render();
-  }
-
-  document.getElementById('wordInput').addEventListener('input', renderCellCount);
-
-  // Notes: save on blur to avoid hammering Supabase on every keystroke
-  document.getElementById('gameNotes').addEventListener('blur', async () => {
-    gameState.notes = document.getElementById('gameNotes').value;
-    await saveState(gameState);
-  });
-
-  async function submitMove() {
-    if (isLocked || !connected) return;
-
-    const val = document.getElementById('wordInput').value.trim().toUpperCase();
-    if (selectedIndices.length === 0 || val.length !== selectedIndices.length) {
-      alert('Selected cells must match the number of letters typed.');
-      return;
-    }
-
-    // Claim player number on first move if not yet assigned
-    if (!myPlayerNumber) {
-      myPlayerNumber = String(gameState.turn);
-      localStorage.setItem('player_num_' + ROOM_ID, myPlayerNumber);
-    }
-
-    if (parseInt(myPlayerNumber) !== gameState.turn) {
-      alert("It's not your turn.");
-      return;
-    }
-
-    // Apply move locally
-    selectedIndices.forEach((idx, i) => {
-      if (val[i]) gameState.grid[idx] = { char: val[i], p: parseInt(myPlayerNumber) };
-    });
-
-    gameState.turn  = gameState.turn === 1 ? 2 : 1;
-    gameState.notes = document.getElementById('gameNotes').value;
-
-    // Lock immediately — unlocks when real-time update comes back with our turn
-    isLocked = true;
-    selectedIndices = [];
-    document.getElementById('wordInput').value = '';
-
-    render();
-
-    // Persist to Supabase — real-time subscription will notify the other player
-    await saveState(gameState);
-  }
-
-  async function resetGame() {
-    if (!confirm('Reset the game? This clears the board for both players.')) return;
-    localStorage.removeItem('player_num_' + ROOM_ID);
-    myPlayerNumber = null;
-    isLocked       = false;
-    selectedIndices = [];
-    gameState = { grid: Array(25).fill(''), turn: 1, notes: '' };
-    render();
-    await saveState(gameState);
-  }
-
-  // ── START ────────────────────────────────────────────────────────
-  init();
-</script>
 </body>
 </html>
